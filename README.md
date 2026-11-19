@@ -22,3 +22,18 @@ docker stop imgbuild-registry
 ```
 
 Use a separate `--work` directory per concurrent invocation. Only build Dockerfiles you trust.
+
+## Releases
+
+Release Please opens a version and changelog PR from Conventional Commits on
+`main`. Merging that PR creates the GitHub release and publishes a versioned
+image to GHCR for Linux amd64 and arm64. Pushing a matching version tag on
+`main` also publishes the image. After the first publish, set the GHCR package
+visibility to **Public** to allow anonymous pulls.
+
+```sh
+docker run --rm ghcr.io/wikibusiness/docker-builder:v0.1.0 --help
+```
+
+Dockerfile `RUN` steps need access to a local Linux Docker daemon and its
+storage. The container image does not start a Docker daemon.
