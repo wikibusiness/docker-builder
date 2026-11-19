@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    services:
+      registry:
+        image: registry:3@sha256:82f6ff4a7f982960c8aa51617fea3aabc485df6e55cce80d22deb1de36f1bc3c
+        ports:
+          - 5000/tcp
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - run: cargo +stable test --locked
+      - run: cargo +stable build --locked
+      - run: bash tests/incremental.sh
+        env:
+          IMGBUILD: ${{ github.workspace }}/target/debug/imgbuild
+          IMGBUILD_CI_IMAGE: localhost:${{ job.services.registry.ports['5000'] }}/test/imgbuild
+          IMGBUILD_CACHE_REPO: localhost:${{ job.services.registry.ports['5000'] }}/test/imgbuild-cache
