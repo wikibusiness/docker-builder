@@ -18,7 +18,7 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use crate::docker_cache;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufWriter, Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -3525,6 +3525,10 @@ impl B {
 }
 
 pub async fn build(mut o: Opts) -> Result<String> {
+    for platforms in [&mut o.platforms, &mut o.all_platforms] {
+        let mut seen = HashSet::new();
+        platforms.retain(|p| seen.insert(p.clone()));
+    }
     // Absolute once: resolving a relative path calls getcwd, which costs ~100 µs on macOS, per context file.
     o.context = std::path::absolute(&o.context)?;
     let work = o.work.clone();
