@@ -23,6 +23,21 @@ docker stop imgbuild-registry
 
 Use a separate `--work` directory per concurrent invocation. Only build Dockerfiles you trust.
 
+## Live staging pulls
+
+A pull that starts before a push ends cannot get anything: a registry refuses a manifest whose layers are missing. With
+`IMGBUILD_STREAM_URL` set to a staging registry that implements `/_stream/` (comma separated; a name that resolves to
+several addresses is one target per address, since every replica that serves pulls keeps its own copies), the final
+image's push also
+
+- announces its manifest as soon as every layer digest is known, before any layer is uploaded
+  (`PUT /_stream/manifest/<repo>/<tag or digest>`), and
+- copies each layer it uploads (`PUT /_stream/blob/<repo>/<digest>`), so the registry serves the layer to a pull while
+  the builder is still uploading it.
+
+The registry the image is pushed to stays the source of truth and the copies are an optimisation: a failure is printed
+as `live: ...` and never fails a build. Credentials are the push credentials.
+
 ## Releases
 
 Release Please opens a version and changelog PR from Conventional Commits on

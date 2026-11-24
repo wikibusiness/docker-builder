@@ -2106,6 +2106,7 @@ struct B {
     published: Memo<String>,
     rootfs: Memo<Arc<Rootfs>>,
     uploads: Memo<std::result::Result<(), String>>,
+    live: Option<crate::live::Live>,
     dest: Ref,
     target: usize,
     dirs: Memo<Dirs>,
@@ -2546,7 +2547,20 @@ impl B {
         }
         let f = self.blob_file(b).await?;
         crate::prof::note(&mut sp, "uploaded");
-        reg.put_blob_file(repo, &b.digest, &f).await
+        let copy = self.live.clone().filter(|_| host == self.dest.host && repo == self.dest.repo).map(|live| {
+            let (repo, digest, f) = (repo.to_string(), b.digest.clone(), f.clone());
+            tokio::spawn(async move {
+                if let Err(e) = live.blob_file(&repo, &digest, &f).await {
+                    eprintln!("live: {e:#}");
+                }
+            })
+        });
+        let pushed = reg.put_blob_file(repo, &b.digest, &f).await;
+        if let Some(copy) = copy {
+            // Pulls that started on the copy finish on it: let it end, the registry has the layer by now.
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(120), copy).await;
+        }
+        pushed
     }
 
     /// Pushes `cfg` and a manifest over `layers` into host/repo; returns the manifest bytes and digest.
@@ -2565,14 +2579,6 @@ impl B {
         let reg = self.reg(host);
         let cb = Bytes::from(serde_json::to_vec(cfg)?);
         let cd = sha(&cb);
-        let t = Instant::now();
-        let sp = crate::prof::span("push-layers", || format!("{repo}:{}", tag.unwrap_or("")));
-        tokio::try_join!(ensure(false), reg.put_blob(repo, &cd, cb.clone()))?;
-        drop(sp);
-        if let Some(id) = progress {
-            eprintln!("#{id} pushing layers {:.1}s done", t.elapsed().as_secs_f64());
-        }
-        let t = Instant::now();
         let mut m = json!({
             "schemaVersion": 2,
             "mediaType": "application/vnd.oci.image.manifest.v1+json",
@@ -2594,6 +2600,27 @@ impl B {
         let mb = Bytes::from(serde_json::to_vec(&m)?);
         let md = sha(&mb);
         let mt = "application/vnd.oci.image.manifest.v1+json";
+        if key.is_none() && let Some(live) = &self.live {
+            // The layer digests are known before any layer is uploaded: a pull that starts now needs only the layers.
+            let announced = async {
+                live.blob_bytes(repo, &cd, cb.clone()).await?;
+                if let Some(tag) = tag {
+                    live.manifest(repo, tag, mt, mb.clone()).await?;
+                }
+                live.manifest(repo, &md, mt, mb.clone()).await
+            };
+            if let Err(e) = announced.await {
+                eprintln!("live: {e:#}");
+            }
+        }
+        let t = Instant::now();
+        let sp = crate::prof::span("push-layers", || format!("{repo}:{}", tag.unwrap_or("")));
+        tokio::try_join!(ensure(false), reg.put_blob(repo, &cd, cb.clone()))?;
+        drop(sp);
+        if let Some(id) = progress {
+            eprintln!("#{id} pushing layers {:.1}s done", t.elapsed().as_secs_f64());
+        }
+        let t = Instant::now();
         let _s = crate::prof::span("push-manifest", || format!("{repo}:{}", tag.unwrap_or(&md)));
         if reg.put_manifest(repo, tag.unwrap_or(&md), mt, mb.clone()).await.is_err() {
             // Tags are immutable: a concurrent build with the same step key, or an earlier run's part of this
@@ -3583,7 +3610,7 @@ async fn build_in(o: Opts) -> Result<String> {
         ignore: Ignore::load(&o.context, &o.dockerfile),
         o, globals, stages, args, host, cache,
         regs: Default::default(), plans: Default::default(), states: Default::default(), images: Default::default(), tops: Default::default(),
-        published: Default::default(), rootfs: Default::default(), uploads: Default::default(), dest: d0.clone(), target, dirs: Default::default(), blobs: Default::default(), docker: OnceCell::new(),
+        published: Default::default(), rootfs: Default::default(), uploads: Default::default(), live: crate::live::Live::from_env(&d0.host), dest: d0.clone(), target, dirs: Default::default(), blobs: Default::default(), docker: OnceCell::new(),
         binfmt: Default::default(), t0,
     });
     let platforms = b.o.platforms.clone();
