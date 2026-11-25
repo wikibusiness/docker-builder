@@ -69,6 +69,13 @@ fn h(parts: &[&str]) -> String {
     hex::encode(d.finalize())
 }
 
+fn scoped_key(scope: Option<&str>, key: String) -> String {
+    match scope {
+        Some(scope) => h(&["cache-scope", scope, &key]),
+        None => key,
+    }
+}
+
 fn sha(b: &[u8]) -> String {
     format!("sha256:{}", hex::encode(Sha256::digest(b)))
 }
@@ -2098,6 +2105,7 @@ struct B {
     args: BTreeMap<String, String>,
     host: String,
     cache: Ref,
+    cache_scope: Option<String>,
     regs: Mutex<HashMap<String, Reg>>,
     plans: Memo<Arc<Plan>>,
     states: Memo<std::result::Result<State, String>>,
@@ -2244,6 +2252,9 @@ impl B {
             let (c, k) = (s.cfg.clone(), s.key.clone());
             (Base::Image(s), c, k)
         };
+        if !matches!(base, Base::Stage(_)) {
+            ikey = scoped_key(self.cache_scope.as_deref(), ikey);
+        }
         if !cfg["config"].is_object() {
             cfg["config"] = json!({});
         }
@@ -2434,7 +2445,11 @@ impl B {
                                 let id = kv.get("id").copied().unwrap_or(target);
                                 // One volume for every platform, as in BuildKit: what a cache holds that does not depend on
                                 // the CPU (downloads, wheels built from source) is then made once, by the native run.
-                                mounts.push((format!("imgbuild-cache-{}", &h(&[id])[..16]), target.to_string()));
+                                let volume = match self.cache_scope.as_deref() {
+                                    Some(scope) => format!("imgbuild-cache-scoped-{}", h(&[scope, id])),
+                                    None => format!("imgbuild-cache-{}", &h(&[id])[..16]),
+                                };
+                                mounts.push((volume, target.to_string()));
                             }
                             Some(("network", n)) => network = Some(n.to_string()),
                             _ => bail!("RUN --{flag} is not supported"),
@@ -2710,6 +2725,9 @@ impl B {
                     Base::Image(s) => s.clone(),
                     Base::Stage(j) => self.state(*j, tp).await?,
                 };
+                if !matches!(&plan.base, Base::Stage(_)) {
+                    st.key = scoped_key(self.cache_scope.as_deref(), st.key);
+                }
                 st.cfg = with_diff_ids(&plan.init_cfg, &st.layers);
                 st
             }
@@ -3345,8 +3363,8 @@ impl B {
     /// Which RUN this is across builds on this machine, for its seed (see `run_incremental`); None when the
     /// command is not one that may run on its own earlier result.
     fn lineage(&self, state: &State, plan: &Plan, step: &Step, argv: &[String]) -> Option<String> {
-        incremental(argv).then(|| h(&["seed", &plan.platform, &docker_for(arch_of(&plan.platform)).unwrap_or_default(),
-            &self.o.dockerfile.to_string_lossy(), &plan.name, &step.text, &state.cfg["config"].to_string()]))
+        incremental(argv).then(|| scoped_key(self.cache_scope.as_deref(), h(&["seed", &plan.platform, &docker_for(arch_of(&plan.platform)).unwrap_or_default(),
+            &self.o.dockerfile.to_string_lossy(), &plan.name, &step.text, &state.cfg["config"].to_string()])))
     }
 
     /// Runs the step in a container of its last result on this machine (the seed) with this build's changed
@@ -3583,7 +3601,13 @@ async fn build_in(o: Opts) -> Result<String> {
     };
     let host = format!("linux/{}", match std::env::consts::ARCH { "aarch64" => "arm64", _ => "amd64" });
     let args = o.build_args.iter().map(|a| a.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())).context("--build-arg K=V")).collect::<Result<_>>()?;
+    let cache_scope = std::env::var_os("IMGBUILD_CACHE_SCOPE").map(|s| {
+        let s = s.into_string().map_err(|_| anyhow::anyhow!("IMGBUILD_CACHE_SCOPE must be UTF-8"))?;
+        ensure!(!s.trim().is_empty(), "IMGBUILD_CACHE_SCOPE must not be empty");
+        Ok(s)
+    }).transpose()?;
     let b = Arc::new(B {
+        cache_scope,
         ignore: Ignore::load(&o.context, &o.dockerfile),
         o, globals, stages, args, host, cache,
         regs: Default::default(), plans: Default::default(), states: Default::default(), images: Default::default(), tops: Default::default(),

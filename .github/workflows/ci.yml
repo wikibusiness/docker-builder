@@ -29,6 +29,7 @@ jobs:
       - run: |
           bash tests/incremental.sh
           bash tests/duplicate-platforms.sh
+          bash tests/cache-scope.sh
         env:
           IMGBUILD: ${{ github.workspace }}/target/debug/imgbuild
           IMGBUILD_CI_IMAGE: localhost:${{ job.services.registry.ports['5000'] }}/test/imgbuild

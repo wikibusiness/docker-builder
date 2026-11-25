@@ -23,6 +23,10 @@ docker stop imgbuild-registry
 
 Use a separate `--work` directory per concurrent invocation. Only build Dockerfiles you trust.
 
+## Cache scope
+
+On a shared builder, set `IMGBUILD_CACHE_SCOPE` in the trusted job launcher before `imgbuild build` to keep Dockerfile cache mounts, step results and incremental seeds distinct. Include the trust domain, toolchain and build target in the scope, and keep it stable across builds that should reuse cache. Do not take it from Dockerfile arguments or other job-controlled input. Unset preserves existing cache names and keys. This does not isolate daemon or registry access; jobs must not have access to either control plane.
+
 ## Releases
 
 Release Please opens a version and changelog PR from Conventional Commits on
