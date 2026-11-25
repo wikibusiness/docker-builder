@@ -35,7 +35,7 @@ image's push also
 - copies each layer it uploads (`PUT /_stream/blob/<repo>/<digest>`), so the registry serves the layer to a pull while
   the builder is still uploading it.
 
-With `IMGBUILD_EARLY_RUN=1`, completed final-stage `RUN` layers also upload in the background while subsequent steps run. If live streaming is enabled, each gets a staging-only prefetch manifest named `prefetch-<arch>-<first 32 hex digits of sha256(image tag)>-<layer ordinal>`. An agent can fetch it into containerd on the scheduled pod’s node. These references are not app tags and are never published to Harbor. The final manifest and the final image tag still describe the whole image.
+With `IMGBUILD_EARLY_RUN=1`, completed final-stage `RUN` and `COPY` layers can upload in the background while subsequent steps run (up to two early uploads per build). If live streaming is enabled, each gets a staging-only prefetch manifest named `prefetch-<arch>-<first 32 hex digits of sha256(image tag)>-<layer ordinal>`. An agent can fetch it into containerd on the scheduled pod’s node. These references are not app tags and are never published to Harbor. The final manifest and the final image tag still describe the whole image.
 
 The destination registry stays the source of truth. Live copy failures are logged and don't fail a build. Live writes use the push credentials.
 

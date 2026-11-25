@@ -2571,6 +2571,27 @@ impl B {
         pushed
     }
 
+    fn upload_early(self: &Arc<Self>, platform: &str, first: usize, layers: &[Blob]) {
+        let Some(slots) = &self.early_run else { return };
+        for (i, blob) in layers.iter().enumerate().filter(|(_, blob)| blob.local.is_some()) {
+            let Ok(slot) = slots.clone().try_acquire_owned() else { break };
+            let (me, blob, platform) = (self.clone(), blob.clone(), platform.to_string());
+            tokio::spawn(async move {
+                let _slot = slot;
+                if let Some(live) = &me.live {
+                    let tag_hash = sha(me.dest.reference.as_bytes());
+                    let ordinal = first + i;
+                    let tag = format!("prefetch-{}-{}-{ordinal}", arch_of(&platform), &tag_hash[7..39]);
+                    let announce = live.prefetch(&me.dest.repo, &tag, &platform, &blob.digest, &blob.diff_id, blob.size, &blob.media_type);
+                    if !matches!(tokio::time::timeout(std::time::Duration::from_secs(2), announce).await, Ok(Ok(()))) {
+                        eprintln!("live prefetch: could not announce {tag}");
+                    }
+                }
+                let _ = me.ensure_blob(&me.dest.host, &me.dest.repo, &blob).await;
+            });
+        }
+    }
+
     /// Pushes `cfg` and a manifest over `layers` into host/repo; returns the manifest bytes and digest.
     /// With `progress` (a step number), logs each phase as `docker push` does.
     #[allow(clippy::too_many_arguments)]
@@ -2779,7 +2800,7 @@ impl B {
                         cached_all(&mut pending);
                         step_cached(&label, i, n, &s.text);
                     } else {
-                        self.flush(&mut state, &mut pending, &label, n, idx == self.target).await?;
+                        self.flush(&mut state, &mut pending, &label, n, (idx == self.target).then_some(tp)).await?;
                         step_open(&label, i, n, &s.text);
                         let seed_key = h(&["copy-seed", &state.key, sp, &s.text]);
                         let chown = self.ids(&state, chown.as_ref()).await?;
@@ -2809,6 +2830,9 @@ impl B {
                         step_done(&label, &format!(" ({:.1} MB)", bs.iter().map(|b| b.size).sum::<u64>() as f64 / 1e6));
                         state.layers.extend(bs);
                         }
+                        if idx == self.target {
+                            self.upload_early(tp, n0, &state.layers[n0..]);
+                        }
                         // The layers' uncompressed digests are the content key: they cover every path, owner, mode and byte.
                         let ids: Vec<&str> = state.layers[n0..].iter().map(|b| b.diff_id.as_str()).collect();
                         let content = if ids.len() == 1 { ids[0].to_string() } else { h(&ids) };
@@ -2836,27 +2860,11 @@ impl B {
                         cached_all(&mut pending);
                         step_cached(&label, i, n, &s.text);
                     } else {
-                        self.flush(&mut state, &mut pending, &label, n, idx == self.target).await?;
+                        self.flush(&mut state, &mut pending, &label, n, (idx == self.target).then_some(tp)).await?;
                         step_open(&label, i, n, &s.text);
                         let blobs = self.run(&state, &plan, s, &lookup, argv, env, mounts, secrets, network.as_deref(), &label, idx == self.target).await?;
-                        if idx == self.target && let Some(slots) = &self.early_run {
-                            for (i, blob) in blobs.iter().enumerate().filter(|(_, blob)| blob.local.is_some()) {
-                                let Ok(slot) = slots.clone().try_acquire_owned() else { break };
-                                let (me, blob, platform) = (self.clone(), blob.clone(), tp.to_string());
-                                let ordinal = state.layers.len() + i;
-                                tokio::spawn(async move {
-                                    let _slot = slot;
-                                    if let Some(live) = &me.live {
-                                        let tag_hash = sha(me.dest.reference.as_bytes());
-                                        let tag = format!("prefetch-{}-{}-{ordinal}", arch_of(&platform), &tag_hash[7..39]);
-                                        let announce = live.prefetch(&me.dest.repo, &tag, &platform, &blob.digest, &blob.diff_id, blob.size, &blob.media_type);
-                                        if !matches!(tokio::time::timeout(std::time::Duration::from_secs(2), announce).await, Ok(Ok(()))) {
-                                            eprintln!("live prefetch: could not announce {tag}");
-                                        }
-                                    }
-                                    let _ = me.ensure_blob(&me.dest.host, &me.dest.repo, &blob).await;
-                                });
-                            }
+                        if idx == self.target {
+                            self.upload_early(tp, state.layers.len(), &blobs);
                         }
                         state.layers.extend(blobs);
                         state.key = lookup.clone();
@@ -2870,12 +2878,12 @@ impl B {
                 self.record_bg(&state, &s.ikey, ()).await?;
             }
         }
-        self.flush(&mut state, &mut pending, &label, n, idx == self.target).await?;
+        self.flush(&mut state, &mut pending, &label, n, (idx == self.target).then_some(tp)).await?;
         Ok(state)
     }
 
     /// Builds the pending context COPY layers onto `state`; its key already covers them.
-    async fn flush(self: &Arc<Self>, state: &mut State, pending: &mut Vec<(usize, &Step)>, label: &str, n: usize, final_stage: bool) -> Result<()> {
+    async fn flush(self: &Arc<Self>, state: &mut State, pending: &mut Vec<(usize, &Step)>, label: &str, n: usize, final_platform: Option<&str>) -> Result<()> {
         for (i, s) in pending.drain(..) {
             step_open(label, i, n, &s.text);
             let Op::Copy { sources, dest, chown, chmod, .. } = &s.op else { unreachable!() };
@@ -2902,9 +2910,13 @@ impl B {
                 }
             };
             step_done(label, &format!(" ({:.1} MB)", b.size as f64 / 1e6));
-            if final_stage {
-                let (me, bb) = (self.clone(), b.clone());
-                tokio::spawn(async move { me.ensure_blob(&me.dest.host, &me.dest.repo, &bb).await.ok() });
+            if let Some(platform) = final_platform {
+                if self.early_run.is_some() {
+                    self.upload_early(platform, state.layers.len(), std::slice::from_ref(&b));
+                } else {
+                    let (me, bb) = (self.clone(), b.clone());
+                    tokio::spawn(async move { me.ensure_blob(&me.dest.host, &me.dest.repo, &bb).await.ok() });
+                }
             }
             state.layers.push(b);
         }
