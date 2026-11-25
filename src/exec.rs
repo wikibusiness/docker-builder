@@ -18,7 +18,7 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use crate::docker_cache;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufWriter, Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -67,6 +67,13 @@ fn h(parts: &[&str]) -> String {
         d.update([0]);
     }
     hex::encode(d.finalize())
+}
+
+fn scoped_key(scope: Option<&str>, key: String) -> String {
+    match scope {
+        Some(scope) => h(&["cache-scope", scope, &key]),
+        None => key,
+    }
 }
 
 fn sha(b: &[u8]) -> String {
@@ -2098,6 +2105,7 @@ struct B {
     args: BTreeMap<String, String>,
     host: String,
     cache: Ref,
+    cache_scope: Option<String>,
     regs: Mutex<HashMap<String, Reg>>,
     plans: Memo<Arc<Plan>>,
     states: Memo<std::result::Result<State, String>>,
@@ -2246,6 +2254,9 @@ impl B {
             let (c, k) = (s.cfg.clone(), s.key.clone());
             (Base::Image(s), c, k)
         };
+        if !matches!(base, Base::Stage(_)) {
+            ikey = scoped_key(self.cache_scope.as_deref(), ikey);
+        }
         if !cfg["config"].is_object() {
             cfg["config"] = json!({});
         }
@@ -2436,7 +2447,11 @@ impl B {
                                 let id = kv.get("id").copied().unwrap_or(target);
                                 // One volume for every platform, as in BuildKit: what a cache holds that does not depend on
                                 // the CPU (downloads, wheels built from source) is then made once, by the native run.
-                                mounts.push((format!("imgbuild-cache-{}", &h(&[id])[..16]), target.to_string()));
+                                let volume = match self.cache_scope.as_deref() {
+                                    Some(scope) => format!("imgbuild-cache-scoped-{}", h(&[scope, id])),
+                                    None => format!("imgbuild-cache-{}", &h(&[id])[..16]),
+                                };
+                                mounts.push((volume, target.to_string()));
                             }
                             Some(("network", n)) => network = Some(n.to_string()),
                             _ => bail!("RUN --{flag} is not supported"),
@@ -2571,22 +2586,13 @@ impl B {
         pushed
     }
 
-    fn upload_early(self: &Arc<Self>, platform: &str, first: usize, layers: &[Blob]) {
+    fn upload_early(self: &Arc<Self>, layers: &[Blob]) {
         let Some(slots) = &self.early_run else { return };
-        for (i, blob) in layers.iter().enumerate().filter(|(_, blob)| blob.local.is_some()) {
+        for blob in layers.iter().filter(|blob| blob.local.is_some()) {
             let Ok(slot) = slots.clone().try_acquire_owned() else { break };
-            let (me, blob, platform) = (self.clone(), blob.clone(), platform.to_string());
+            let (me, blob) = (self.clone(), blob.clone());
             tokio::spawn(async move {
                 let _slot = slot;
-                if let Some(live) = &me.live {
-                    let tag_hash = sha(me.dest.reference.as_bytes());
-                    let ordinal = first + i;
-                    let tag = format!("prefetch-{}-{}-{ordinal}", arch_of(&platform), &tag_hash[7..39]);
-                    let announce = live.prefetch(&me.dest.repo, &tag, &platform, &blob.digest, &blob.diff_id, blob.size, &blob.media_type);
-                    if !matches!(tokio::time::timeout(std::time::Duration::from_secs(2), announce).await, Ok(Ok(()))) {
-                        eprintln!("live prefetch: could not announce {tag}");
-                    }
-                }
                 let _ = me.ensure_blob(&me.dest.host, &me.dest.repo, &blob).await;
             });
         }
@@ -2766,6 +2772,9 @@ impl B {
                     Base::Image(s) => s.clone(),
                     Base::Stage(j) => self.state(*j, tp).await?,
                 };
+                if !matches!(&plan.base, Base::Stage(_)) {
+                    st.key = scoped_key(self.cache_scope.as_deref(), st.key);
+                }
                 st.cfg = with_diff_ids(&plan.init_cfg, &st.layers);
                 st
             }
@@ -2832,7 +2841,7 @@ impl B {
                         state.layers.extend(bs);
                         }
                         if idx == self.target && Some(i) != last_layer {
-                            self.upload_early(tp, n0, &state.layers[n0..]);
+                            self.upload_early(&state.layers[n0..]);
                         }
                         // The layers' uncompressed digests are the content key: they cover every path, owner, mode and byte.
                         let ids: Vec<&str> = state.layers[n0..].iter().map(|b| b.diff_id.as_str()).collect();
@@ -2865,7 +2874,7 @@ impl B {
                         step_open(&label, i, n, &s.text);
                         let blobs = self.run(&state, &plan, s, &lookup, argv, env, mounts, secrets, network.as_deref(), &label, idx == self.target).await?;
                         if idx == self.target && Some(i) != last_layer {
-                            self.upload_early(tp, state.layers.len(), &blobs);
+                            self.upload_early(&blobs);
                         }
                         state.layers.extend(blobs);
                         state.key = lookup.clone();
@@ -2911,12 +2920,12 @@ impl B {
                 }
             };
             step_done(label, &format!(" ({:.1} MB)", b.size as f64 / 1e6));
-            if let Some(platform) = final_platform {
+            if final_platform.is_some() {
                 if self.early_run.is_none() {
                     let (me, bb) = (self.clone(), b.clone());
                     tokio::spawn(async move { me.ensure_blob(&me.dest.host, &me.dest.repo, &bb).await.ok() });
                 } else if Some(i) != last_layer {
-                    self.upload_early(platform, state.layers.len(), std::slice::from_ref(&b));
+                    self.upload_early(std::slice::from_ref(&b));
                 }
             }
             state.layers.push(b);
@@ -3412,8 +3421,8 @@ impl B {
     /// Which RUN this is across builds on this machine, for its seed (see `run_incremental`); None when the
     /// command is not one that may run on its own earlier result.
     fn lineage(&self, state: &State, plan: &Plan, step: &Step, argv: &[String]) -> Option<String> {
-        incremental(argv).then(|| h(&["seed", &plan.platform, &docker_for(arch_of(&plan.platform)).unwrap_or_default(),
-            &self.o.dockerfile.to_string_lossy(), &plan.name, &step.text, &state.cfg["config"].to_string()]))
+        incremental(argv).then(|| scoped_key(self.cache_scope.as_deref(), h(&["seed", &plan.platform, &docker_for(arch_of(&plan.platform)).unwrap_or_default(),
+            &self.o.dockerfile.to_string_lossy(), &plan.name, &step.text, &state.cfg["config"].to_string()])))
     }
 
     /// Runs the step in a container of its last result on this machine (the seed) with this build's changed
@@ -3592,6 +3601,10 @@ impl B {
 }
 
 pub async fn build(mut o: Opts) -> Result<String> {
+    for platforms in [&mut o.platforms, &mut o.all_platforms] {
+        let mut seen = HashSet::new();
+        platforms.retain(|p| seen.insert(p.clone()));
+    }
     // Absolute once: resolving a relative path calls getcwd, which costs ~100 µs on macOS, per context file.
     o.context = std::path::absolute(&o.context)?;
     let work = o.work.clone();
@@ -3646,7 +3659,13 @@ async fn build_in(o: Opts) -> Result<String> {
     };
     let host = format!("linux/{}", match std::env::consts::ARCH { "aarch64" => "arm64", _ => "amd64" });
     let args = o.build_args.iter().map(|a| a.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())).context("--build-arg K=V")).collect::<Result<_>>()?;
+    let cache_scope = std::env::var_os("IMGBUILD_CACHE_SCOPE").map(|s| {
+        let s = s.into_string().map_err(|_| anyhow::anyhow!("IMGBUILD_CACHE_SCOPE must be UTF-8"))?;
+        ensure!(!s.trim().is_empty(), "IMGBUILD_CACHE_SCOPE must not be empty");
+        Ok(s)
+    }).transpose()?;
     let b = Arc::new(B {
+        cache_scope,
         ignore: Ignore::load(&o.context, &o.dockerfile),
         o, globals, stages, args, host, cache,
         regs: Default::default(), plans: Default::default(), states: Default::default(), images: Default::default(), tops: Default::default(),
