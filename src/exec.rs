@@ -2777,6 +2777,7 @@ impl B {
             }
         }
         let n = plan.steps.len();
+        let last_layer = plan.steps.iter().rposition(|s| !matches!(s.op, Op::Config));
         for (i, s) in plan.steps.iter().enumerate().take(start) {
             if !matches!(s.op, Op::Config) {
                 step_cached(&label, i, n, &s.text);
@@ -2800,7 +2801,7 @@ impl B {
                         cached_all(&mut pending);
                         step_cached(&label, i, n, &s.text);
                     } else {
-                        self.flush(&mut state, &mut pending, &label, n, (idx == self.target).then_some(tp)).await?;
+                        self.flush(&mut state, &mut pending, &label, n, (idx == self.target).then_some(tp), last_layer).await?;
                         step_open(&label, i, n, &s.text);
                         let seed_key = h(&["copy-seed", &state.key, sp, &s.text]);
                         let chown = self.ids(&state, chown.as_ref()).await?;
@@ -2830,7 +2831,7 @@ impl B {
                         step_done(&label, &format!(" ({:.1} MB)", bs.iter().map(|b| b.size).sum::<u64>() as f64 / 1e6));
                         state.layers.extend(bs);
                         }
-                        if idx == self.target {
+                        if idx == self.target && Some(i) != last_layer {
                             self.upload_early(tp, n0, &state.layers[n0..]);
                         }
                         // The layers' uncompressed digests are the content key: they cover every path, owner, mode and byte.
@@ -2860,10 +2861,10 @@ impl B {
                         cached_all(&mut pending);
                         step_cached(&label, i, n, &s.text);
                     } else {
-                        self.flush(&mut state, &mut pending, &label, n, (idx == self.target).then_some(tp)).await?;
+                        self.flush(&mut state, &mut pending, &label, n, (idx == self.target).then_some(tp), last_layer).await?;
                         step_open(&label, i, n, &s.text);
                         let blobs = self.run(&state, &plan, s, &lookup, argv, env, mounts, secrets, network.as_deref(), &label, idx == self.target).await?;
-                        if idx == self.target {
+                        if idx == self.target && Some(i) != last_layer {
                             self.upload_early(tp, state.layers.len(), &blobs);
                         }
                         state.layers.extend(blobs);
@@ -2878,12 +2879,12 @@ impl B {
                 self.record_bg(&state, &s.ikey, ()).await?;
             }
         }
-        self.flush(&mut state, &mut pending, &label, n, (idx == self.target).then_some(tp)).await?;
+        self.flush(&mut state, &mut pending, &label, n, (idx == self.target).then_some(tp), last_layer).await?;
         Ok(state)
     }
 
     /// Builds the pending context COPY layers onto `state`; its key already covers them.
-    async fn flush(self: &Arc<Self>, state: &mut State, pending: &mut Vec<(usize, &Step)>, label: &str, n: usize, final_platform: Option<&str>) -> Result<()> {
+    async fn flush(self: &Arc<Self>, state: &mut State, pending: &mut Vec<(usize, &Step)>, label: &str, n: usize, final_platform: Option<&str>, last_layer: Option<usize>) -> Result<()> {
         for (i, s) in pending.drain(..) {
             step_open(label, i, n, &s.text);
             let Op::Copy { sources, dest, chown, chmod, .. } = &s.op else { unreachable!() };
@@ -2911,11 +2912,11 @@ impl B {
             };
             step_done(label, &format!(" ({:.1} MB)", b.size as f64 / 1e6));
             if let Some(platform) = final_platform {
-                if self.early_run.is_some() {
-                    self.upload_early(platform, state.layers.len(), std::slice::from_ref(&b));
-                } else {
+                if self.early_run.is_none() {
                     let (me, bb) = (self.clone(), b.clone());
                     tokio::spawn(async move { me.ensure_blob(&me.dest.host, &me.dest.repo, &bb).await.ok() });
+                } else if Some(i) != last_layer {
+                    self.upload_early(platform, state.layers.len(), std::slice::from_ref(&b));
                 }
             }
             state.layers.push(b);
