@@ -39,6 +39,8 @@ With `IMGBUILD_EARLY_RUN=1`, completed final-stage `RUN` and `COPY` layers can u
 
 With `IMGBUILD_IMAGE_VOLUME=1` as well, the builder announces an ordered series of staging-only OCI prefixes at `<tag>-ocean-warm-<arch>-1`, `-2`, and so on. A prefix includes the base or cached layers already resolved and every newly completed layer group in its actual final order, including groups from stages the final image inherits. Kubernetes can request the prefixes in order as image volumes and reuse their layers when pulling the app image. These tags are never published to Harbor; the app tag and digest are unchanged. The staging proxy falls back to the completed platform image for unused slots.
 
+`IMGBUILD_STANDALONE_WARMUP_SLOTS=4,6` makes only those selected slots contain their newly completed layers instead of the full prefix. Use these references for independent warmup pods, not for the app. A cumulative prefix can reuse the app's unpacked filesystem; a standalone slot can start fetching without waiting for the prior prefix to unpack. Containerd must retain compressed layers (`discard_unpacked_layers = false`) for the app to reuse a standalone slot's downloaded blobs.
+
 The destination registry stays the source of truth. Live copy failures are logged and don't fail a build. Live writes use the push credentials.
 
 ## Cache scope

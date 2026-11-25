@@ -2117,6 +2117,7 @@ struct B {
     live: Option<crate::live::Live>,
     early_run: Option<Arc<tokio::sync::Semaphore>>,
     warm_platforms: Option<Mutex<HashMap<String, (usize, usize)>>>,
+    standalone_warmup_slots: Vec<usize>,
     dest: Ref,
     target: usize,
     dirs: Memo<Dirs>,
@@ -2617,18 +2618,18 @@ impl B {
     fn warm_prefix(self: &Arc<Self>, platform: &str, base: &[Blob], next: &[Blob]) {
         let (Some(live), Some(platforms)) = (self.live.clone(), &self.warm_platforms) else { return };
         let count = base.len() + next.len();
-        let slot = {
+        let (slot, previous) = {
             let mut platforms = platforms.lock().unwrap();
             let (slot, published) = platforms.entry(platform.to_string()).or_default();
             if count <= *published { return }
-            *published = count;
             *slot += 1;
-            *slot
+            (*slot, std::mem::replace(published, count))
         };
         let me = self.clone();
         let tag = format!("{}-ocean-warm-{}-{slot}", self.dest.reference, arch_of(platform));
         if tag.len() > 128 { return }
-        let layers: Vec<_> = base.iter().chain(next).cloned().collect();
+        let skip = if self.standalone_warmup_slots.contains(&slot) { previous } else { 0 };
+        let layers: Vec<_> = base.iter().chain(next).skip(skip).cloned().collect();
         let cfg = with_diff_ids(&json!({"os":"linux", "architecture":arch_of(platform), "config":{}}), &layers);
         tokio::spawn(async move {
             let repo = &me.dest.repo;
@@ -3779,8 +3780,14 @@ async fn build_in(o: Opts) -> Result<String> {
         ensure!(!s.trim().is_empty(), "IMGBUILD_CACHE_SCOPE must not be empty");
         Ok(s)
     }).transpose()?;
+    let standalone_warmup_slots = std::env::var("IMGBUILD_STANDALONE_WARMUP_SLOTS").ok()
+        .filter(|s| !s.trim().is_empty()).map(|s| {
+            s.split(',').map(|slot| slot.trim().parse::<std::num::NonZeroUsize>().map(|slot| slot.get()))
+                .collect::<std::result::Result<Vec<_>, _>>()
+        }).transpose().context("IMGBUILD_STANDALONE_WARMUP_SLOTS must be comma-separated positive slot numbers")?
+        .unwrap_or_default();
     let b = Arc::new(B {
-        cache_scope,
+        cache_scope, standalone_warmup_slots,
         ignore: Ignore::load(&o.context, &o.dockerfile),
         o, globals, stages, args, host, cache,
         regs: Default::default(), plans: Default::default(), states: Default::default(), images: Default::default(), tops: Default::default(),
