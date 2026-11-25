@@ -2539,10 +2539,29 @@ impl B {
         c.get_or_init(|| async { self.upload_blob(host, repo, b).await.map_err(|e| format!("{e:#}")) }).await.clone().map_err(anyhow::Error::msg)
     }
 
+    fn layer_timing(&self, op: &str, stage: Option<&str>, started: u128, layers: &[Blob], result: &str) {
+        if std::env::var_os("IMGBUILD_LAYER_TIMING").is_none() || layers.is_empty() {
+            return;
+        }
+        let finished = unix_ms();
+        for b in layers {
+            eprintln!("layer-timing {}", json!({
+                "op": op, "stage": stage, "repo": self.dest.repo, "tag": self.dest.reference,
+                "digest": b.digest, "bytes": b.size, "result": result,
+                "start_unix_ms": started, "end_unix_ms": finished,
+            }));
+        }
+    }
+
     async fn upload_blob(self: &Arc<Self>, host: &str, repo: &str, b: &Blob) -> Result<()> {
         let mut sp = crate::prof::span("push-blob", || format!("{repo} {} {:.1} MB", &b.digest[7..19], b.size as f64 / 1e6));
         let reg = self.reg(host);
+        let dest = host == self.dest.host && repo == self.dest.repo;
+        let started = unix_ms();
         if reg.blob_exists(repo, &b.digest).await? {
+            if dest {
+                self.layer_timing("reuse", None, started, std::slice::from_ref(b), "exists");
+            }
             crate::prof::note(&mut sp, "exists");
             return Ok(());
         }
@@ -2557,7 +2576,11 @@ impl B {
             from.push(self.cache.repo.as_str());
         }
         for f in from {
+            let started = unix_ms();
             if reg.mount(repo, &b.digest, f).await? {
+                if dest {
+                    self.layer_timing("reuse", None, started, std::slice::from_ref(b), "mounted");
+                }
                 crate::prof::note(&mut sp, "mounted");
                 return Ok(());
             }
@@ -2572,11 +2595,15 @@ impl B {
                 }
             })
         });
-        let log = self.early_run.is_some() && host == self.dest.host && repo == self.dest.repo;
+        let log = self.early_run.is_some() && dest;
         if log {
             eprintln!("live upload: start {}", b.digest);
         }
+        let started = unix_ms();
         let pushed = reg.put_blob_file(repo, &b.digest, &f).await;
+        if dest {
+            self.layer_timing("push", None, started, std::slice::from_ref(b), if pushed.is_ok() { "ok" } else { "error" });
+        }
         if log && pushed.is_ok() {
             eprintln!("live upload: done {}", b.digest);
         }
@@ -2615,7 +2642,14 @@ impl B {
             }).to_string());
             let announce = async {
                 live.blob_bytes(repo, &cd, cb).await?;
-                live.manifest(repo, &tag, kind, manifest).await
+                live.manifest(repo, &tag, kind, manifest).await?;
+                if std::env::var_os("IMGBUILD_LAYER_TIMING").is_some() {
+                    eprintln!("layer-prefix {}", json!({
+                        "repo": repo, "tag": tag, "unix_ms": unix_ms(),
+                        "layers": layers.iter().map(|b| &b.digest).collect::<Vec<_>>(),
+                    }));
+                }
+                Ok::<_, anyhow::Error>(())
             };
             let upload = async {
                 let jobs: Vec<_> = layers.iter().map(|layer| me.ensure_blob(&me.dest.host, repo, layer).boxed()).collect();
@@ -2870,6 +2904,7 @@ impl B {
                     } else {
                         self.flush(&mut state, &mut pending, &label, n, delivery).await?;
                         step_open(&label, i, n, &s.text);
+                        let started = unix_ms();
                         let seed_key = h(&["copy-seed", &state.key, sp, &s.text]);
                         let chown = self.ids(&state, chown.as_ref()).await?;
                         let dest = &self.copy_dest(&state, dest).await?;
@@ -2897,6 +2932,9 @@ impl B {
                         }
                         step_done(&label, &format!(" ({:.1} MB)", bs.iter().map(|b| b.size).sum::<u64>() as f64 / 1e6));
                         state.layers.extend(bs);
+                        }
+                        if final_stage {
+                            self.layer_timing("build", Some(&label), started, &state.layers[n0..], "ok");
                         }
                         if let Some(tp) = stream_platform {
                             self.warm_prefix(tp, &state.layers[..n0], &state.layers[n0..]);
@@ -2932,7 +2970,11 @@ impl B {
                     } else {
                         self.flush(&mut state, &mut pending, &label, n, delivery).await?;
                         step_open(&label, i, n, &s.text);
+                        let started = unix_ms();
                         let blobs = self.run(&state, &plan, s, &lookup, argv, env, mounts, secrets, network.as_deref(), &label, final_stage).await?;
+                        if final_stage {
+                            self.layer_timing("build", Some(&label), started, &blobs, "ok");
+                        }
                         if let Some(tp) = stream_platform {
                             self.warm_prefix(tp, &state.layers, &blobs);
                         } else if final_stage && Some(i) != last_layer {
@@ -2970,7 +3012,10 @@ impl B {
             let anc: Vec<String> = (1..=comps.len()).map(|n| comps[..n].join("/")).collect();
             let anc_meta: BTreeMap<String, [u64; 4]> = self.dir_meta(state, &anc).await?.into_iter().map(|(k, m)| (k, [m.uid, m.gid, m.mode as u64, m.mtime])).collect();
             let memo = format!("ctx-{}", h(&[FORMAT, "source mtimes", &s.text, &s.extra, &format!("{chown:?} {chmod:?} {} {CONTEXT_MTIME}", self.o.epoch), &serde_json::to_string(&anc_meta)?]));
-            let b = match local_step(&memo).and_then(|m| m.layers.into_iter().next()) {
+            let started = unix_ms();
+            let cached = local_step(&memo).and_then(|m| m.layers.into_iter().next());
+            let result = if cached.is_some() { "cached" } else { "ok" };
+            let b = match cached {
                 Some(b) => b,
                 None => {
                     let (root, sources, d, chmod) = (self.o.context.clone(), sources.clone(), dest.clone(), *chmod);
@@ -2985,6 +3030,9 @@ impl B {
                 }
             };
             step_done(label, &format!(" ({:.1} MB)", b.size as f64 / 1e6));
+            if final_stage {
+                self.layer_timing("build", Some(label), started, std::slice::from_ref(&b), result);
+            }
             if let Some(platform) = stream_platform {
                 self.warm_prefix(platform, &state.layers, std::slice::from_ref(&b));
             } else if final_stage {
@@ -3868,6 +3916,10 @@ fn incremental(argv: &[String]) -> bool {
         let w: Vec<&str> = part.split_whitespace().filter(|w| !w.contains('=')).collect();
         w.starts_with(&["uv", "sync"]) || w.starts_with(&["pnpm", "install"])
     }))
+}
+
+fn unix_ms() -> u128 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis()
 }
 
 static STEP_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
