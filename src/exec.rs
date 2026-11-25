@@ -2114,6 +2114,8 @@ struct B {
     published: Memo<String>,
     rootfs: Memo<Arc<Rootfs>>,
     uploads: Memo<std::result::Result<(), String>>,
+    live: Option<crate::live::Live>,
+    early_run: Option<Arc<tokio::sync::Semaphore>>,
     dest: Ref,
     target: usize,
     dirs: Memo<Dirs>,
@@ -2561,7 +2563,39 @@ impl B {
         }
         let f = self.blob_file(b).await?;
         crate::prof::note(&mut sp, "uploaded");
-        reg.put_blob_file(repo, &b.digest, &f).await
+        let copy = self.live.clone().filter(|_| host == self.dest.host && repo == self.dest.repo).map(|live| {
+            let (repo, digest, f) = (repo.to_string(), b.digest.clone(), f.clone());
+            tokio::spawn(async move {
+                if let Err(e) = live.blob_file(&repo, &digest, &f).await {
+                    eprintln!("live: {e:#}");
+                }
+            })
+        });
+        let log = self.early_run.is_some() && host == self.dest.host && repo == self.dest.repo;
+        if log {
+            eprintln!("live upload: start {}", b.digest);
+        }
+        let pushed = reg.put_blob_file(repo, &b.digest, &f).await;
+        if log && pushed.is_ok() {
+            eprintln!("live upload: done {}", b.digest);
+        }
+        if let Some(copy) = copy {
+            // Pulls that started on the copy finish on it: let it end, the registry has the layer by now.
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(120), copy).await;
+        }
+        pushed
+    }
+
+    fn upload_early(self: &Arc<Self>, layers: &[Blob]) {
+        let Some(slots) = &self.early_run else { return };
+        for blob in layers.iter().filter(|blob| blob.local.is_some()) {
+            let Ok(slot) = slots.clone().try_acquire_owned() else { break };
+            let (me, blob) = (self.clone(), blob.clone());
+            tokio::spawn(async move {
+                let _slot = slot;
+                let _ = me.ensure_blob(&me.dest.host, &me.dest.repo, &blob).await;
+            });
+        }
     }
 
     /// Pushes `cfg` and a manifest over `layers` into host/repo; returns the manifest bytes and digest.
@@ -2580,14 +2614,6 @@ impl B {
         let reg = self.reg(host);
         let cb = Bytes::from(serde_json::to_vec(cfg)?);
         let cd = sha(&cb);
-        let t = Instant::now();
-        let sp = crate::prof::span("push-layers", || format!("{repo}:{}", tag.unwrap_or("")));
-        tokio::try_join!(ensure(false), reg.put_blob(repo, &cd, cb.clone()))?;
-        drop(sp);
-        if let Some(id) = progress {
-            eprintln!("#{id} pushing layers {:.1}s done", t.elapsed().as_secs_f64());
-        }
-        let t = Instant::now();
         let mut m = json!({
             "schemaVersion": 2,
             "mediaType": "application/vnd.oci.image.manifest.v1+json",
@@ -2609,6 +2635,27 @@ impl B {
         let mb = Bytes::from(serde_json::to_vec(&m)?);
         let md = sha(&mb);
         let mt = "application/vnd.oci.image.manifest.v1+json";
+        if key.is_none() && let Some(live) = &self.live {
+            // The layer digests are known before any layer is uploaded: a pull that starts now needs only the layers.
+            let announced = async {
+                live.blob_bytes(repo, &cd, cb.clone()).await?;
+                if let Some(tag) = tag {
+                    live.manifest(repo, tag, mt, mb.clone()).await?;
+                }
+                live.manifest(repo, &md, mt, mb.clone()).await
+            };
+            if let Err(e) = announced.await {
+                eprintln!("live: {e:#}");
+            }
+        }
+        let t = Instant::now();
+        let sp = crate::prof::span("push-layers", || format!("{repo}:{}", tag.unwrap_or("")));
+        tokio::try_join!(ensure(false), reg.put_blob(repo, &cd, cb.clone()))?;
+        drop(sp);
+        if let Some(id) = progress {
+            eprintln!("#{id} pushing layers {:.1}s done", t.elapsed().as_secs_f64());
+        }
+        let t = Instant::now();
         let _s = crate::prof::span("push-manifest", || format!("{repo}:{}", tag.unwrap_or(&md)));
         if reg.put_manifest(repo, tag.unwrap_or(&md), mt, mb.clone()).await.is_err() {
             // Tags are immutable: a concurrent build with the same step key, or an earlier run's part of this
@@ -2739,6 +2786,7 @@ impl B {
             }
         }
         let n = plan.steps.len();
+        let last_layer = plan.steps.iter().rposition(|s| !matches!(s.op, Op::Config));
         for (i, s) in plan.steps.iter().enumerate().take(start) {
             if !matches!(s.op, Op::Config) {
                 step_cached(&label, i, n, &s.text);
@@ -2762,7 +2810,7 @@ impl B {
                         cached_all(&mut pending);
                         step_cached(&label, i, n, &s.text);
                     } else {
-                        self.flush(&mut state, &mut pending, &label, n, idx == self.target).await?;
+                        self.flush(&mut state, &mut pending, &label, n, (idx == self.target).then_some(tp), last_layer).await?;
                         step_open(&label, i, n, &s.text);
                         let seed_key = h(&["copy-seed", &state.key, sp, &s.text]);
                         let chown = self.ids(&state, chown.as_ref()).await?;
@@ -2792,6 +2840,9 @@ impl B {
                         step_done(&label, &format!(" ({:.1} MB)", bs.iter().map(|b| b.size).sum::<u64>() as f64 / 1e6));
                         state.layers.extend(bs);
                         }
+                        if idx == self.target && Some(i) != last_layer {
+                            self.upload_early(&state.layers[n0..]);
+                        }
                         // The layers' uncompressed digests are the content key: they cover every path, owner, mode and byte.
                         let ids: Vec<&str> = state.layers[n0..].iter().map(|b| b.diff_id.as_str()).collect();
                         let content = if ids.len() == 1 { ids[0].to_string() } else { h(&ids) };
@@ -2819,9 +2870,12 @@ impl B {
                         cached_all(&mut pending);
                         step_cached(&label, i, n, &s.text);
                     } else {
-                        self.flush(&mut state, &mut pending, &label, n, idx == self.target).await?;
+                        self.flush(&mut state, &mut pending, &label, n, (idx == self.target).then_some(tp), last_layer).await?;
                         step_open(&label, i, n, &s.text);
                         let blobs = self.run(&state, &plan, s, &lookup, argv, env, mounts, secrets, network.as_deref(), &label, idx == self.target).await?;
+                        if idx == self.target && Some(i) != last_layer {
+                            self.upload_early(&blobs);
+                        }
                         state.layers.extend(blobs);
                         state.key = lookup.clone();
                         state.cfg = with_diff_ids(&s.cfg, &state.layers);
@@ -2834,12 +2888,12 @@ impl B {
                 self.record_bg(&state, &s.ikey, ()).await?;
             }
         }
-        self.flush(&mut state, &mut pending, &label, n, idx == self.target).await?;
+        self.flush(&mut state, &mut pending, &label, n, (idx == self.target).then_some(tp), last_layer).await?;
         Ok(state)
     }
 
     /// Builds the pending context COPY layers onto `state`; its key already covers them.
-    async fn flush(self: &Arc<Self>, state: &mut State, pending: &mut Vec<(usize, &Step)>, label: &str, n: usize, final_stage: bool) -> Result<()> {
+    async fn flush(self: &Arc<Self>, state: &mut State, pending: &mut Vec<(usize, &Step)>, label: &str, n: usize, final_platform: Option<&str>, last_layer: Option<usize>) -> Result<()> {
         for (i, s) in pending.drain(..) {
             step_open(label, i, n, &s.text);
             let Op::Copy { sources, dest, chown, chmod, .. } = &s.op else { unreachable!() };
@@ -2866,9 +2920,13 @@ impl B {
                 }
             };
             step_done(label, &format!(" ({:.1} MB)", b.size as f64 / 1e6));
-            if final_stage {
-                let (me, bb) = (self.clone(), b.clone());
-                tokio::spawn(async move { me.ensure_blob(&me.dest.host, &me.dest.repo, &bb).await.ok() });
+            if final_platform.is_some() {
+                if self.early_run.is_none() {
+                    let (me, bb) = (self.clone(), b.clone());
+                    tokio::spawn(async move { me.ensure_blob(&me.dest.host, &me.dest.repo, &bb).await.ok() });
+                } else if Some(i) != last_layer {
+                    self.upload_early(std::slice::from_ref(&b));
+                }
             }
             state.layers.push(b);
         }
@@ -3611,7 +3669,8 @@ async fn build_in(o: Opts) -> Result<String> {
         ignore: Ignore::load(&o.context, &o.dockerfile),
         o, globals, stages, args, host, cache,
         regs: Default::default(), plans: Default::default(), states: Default::default(), images: Default::default(), tops: Default::default(),
-        published: Default::default(), rootfs: Default::default(), uploads: Default::default(), dest: d0.clone(), target, dirs: Default::default(), blobs: Default::default(), docker: OnceCell::new(),
+        published: Default::default(), rootfs: Default::default(), uploads: Default::default(), live: crate::live::Live::from_env(&d0.host), dest: d0.clone(), target, dirs: Default::default(), blobs: Default::default(), docker: OnceCell::new(),
+        early_run: (std::env::var("IMGBUILD_EARLY_RUN").as_deref() == Ok("1")).then(|| Arc::new(tokio::sync::Semaphore::new(2))),
         binfmt: Default::default(), t0,
     });
     let platforms = b.o.platforms.clone();

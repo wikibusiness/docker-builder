@@ -23,6 +23,22 @@ docker stop imgbuild-registry
 
 Use a separate `--work` directory per concurrent invocation. Only build Dockerfiles you trust.
 
+## Live staging pulls
+
+A pull that starts before a push ends cannot get anything: a registry refuses a manifest whose layers are missing. With
+`IMGBUILD_STREAM_URL` set to a staging registry that implements `/_stream/` (comma separated; a name that resolves to
+several addresses is one target per address, since every replica that serves pulls keeps its own copies), the final
+image's push also
+
+- announces its manifest as soon as every layer digest is known, before any layer is uploaded
+  (`PUT /_stream/manifest/<repo>/<tag or digest>`), and
+- copies each layer it uploads (`PUT /_stream/blob/<repo>/<digest>`), so the registry serves the layer to a pull while
+  the builder is still uploading it.
+
+With `IMGBUILD_EARLY_RUN=1`, completed final-stage `RUN` and `COPY` layers can upload in the background while subsequent steps run (up to two early uploads per build). A normal pull can start only once the final manifest is known, but it can overlap any uploads still in progress.
+
+The destination registry stays the source of truth. Live copy failures are logged and don't fail a build. Live writes use the push credentials.
+
 ## Cache scope
 
 On a shared builder, set `IMGBUILD_CACHE_SCOPE` in the trusted job launcher before `imgbuild build` to keep Dockerfile cache mounts, step results and incremental seeds distinct. Include the trust domain, toolchain and build target in the scope, and keep it stable across builds that should reuse cache. Do not take it from Dockerfile arguments or other job-controlled input. Unset preserves existing cache names and keys. This does not isolate daemon or registry access; jobs must not have access to either control plane.

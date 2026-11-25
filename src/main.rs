@@ -3,6 +3,7 @@ mod dockerfile;
 mod docker_cache;
 mod exec;
 mod layer;
+mod live;
 mod prof;
 mod registry;
 

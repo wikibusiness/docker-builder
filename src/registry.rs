@@ -49,7 +49,7 @@ pub struct Reg {
     tokens: Arc<Mutex<HashMap<String, String>>>,
 }
 
-fn creds_for(host: &str) -> Option<(String, String)> {
+pub(crate) fn creds_for(host: &str) -> Option<(String, String)> {
     if let (Ok(u), Ok(p)) = (std::env::var("IMGBUILD_USER"), std::env::var("IMGBUILD_PASS")) {
         return Some((u, p));
     }
