@@ -2107,6 +2107,7 @@ struct B {
     rootfs: Memo<Arc<Rootfs>>,
     uploads: Memo<std::result::Result<(), String>>,
     live: Option<crate::live::Live>,
+    early_run: Option<Arc<tokio::sync::Semaphore>>,
     dest: Ref,
     target: usize,
     dirs: Memo<Dirs>,
@@ -2555,7 +2556,14 @@ impl B {
                 }
             })
         });
+        let log = self.early_run.is_some() && host == self.dest.host && repo == self.dest.repo;
+        if log {
+            eprintln!("live upload: start {}", b.digest);
+        }
         let pushed = reg.put_blob_file(repo, &b.digest, &f).await;
+        if log && pushed.is_ok() {
+            eprintln!("live upload: done {}", b.digest);
+        }
         if let Some(copy) = copy {
             // Pulls that started on the copy finish on it: let it end, the registry has the layer by now.
             let _ = tokio::time::timeout(std::time::Duration::from_secs(120), copy).await;
@@ -2831,6 +2839,25 @@ impl B {
                         self.flush(&mut state, &mut pending, &label, n, idx == self.target).await?;
                         step_open(&label, i, n, &s.text);
                         let blobs = self.run(&state, &plan, s, &lookup, argv, env, mounts, secrets, network.as_deref(), &label, idx == self.target).await?;
+                        if idx == self.target && let Some(slots) = &self.early_run {
+                            for (i, blob) in blobs.iter().enumerate().filter(|(_, blob)| blob.local.is_some()) {
+                                let Ok(slot) = slots.clone().try_acquire_owned() else { break };
+                                let (me, blob, platform) = (self.clone(), blob.clone(), tp.to_string());
+                                let ordinal = state.layers.len() + i;
+                                tokio::spawn(async move {
+                                    let _slot = slot;
+                                    if let Some(live) = &me.live {
+                                        let tag_hash = sha(me.dest.reference.as_bytes());
+                                        let tag = format!("prefetch-{}-{}-{ordinal}", arch_of(&platform), &tag_hash[7..39]);
+                                        let announce = live.prefetch(&me.dest.repo, &tag, &platform, &blob.digest, &blob.diff_id, blob.size, &blob.media_type);
+                                        if !matches!(tokio::time::timeout(std::time::Duration::from_secs(2), announce).await, Ok(Ok(()))) {
+                                            eprintln!("live prefetch: could not announce {tag}");
+                                        }
+                                    }
+                                    let _ = me.ensure_blob(&me.dest.host, &me.dest.repo, &blob).await;
+                                });
+                            }
+                        }
                         state.layers.extend(blobs);
                         state.key = lookup.clone();
                         state.cfg = with_diff_ids(&s.cfg, &state.layers);
@@ -3611,6 +3638,7 @@ async fn build_in(o: Opts) -> Result<String> {
         o, globals, stages, args, host, cache,
         regs: Default::default(), plans: Default::default(), states: Default::default(), images: Default::default(), tops: Default::default(),
         published: Default::default(), rootfs: Default::default(), uploads: Default::default(), live: crate::live::Live::from_env(&d0.host), dest: d0.clone(), target, dirs: Default::default(), blobs: Default::default(), docker: OnceCell::new(),
+        early_run: (std::env::var("IMGBUILD_EARLY_RUN").as_deref() == Ok("1")).then(|| Arc::new(tokio::sync::Semaphore::new(2))),
         binfmt: Default::default(), t0,
     });
     let platforms = b.o.platforms.clone();

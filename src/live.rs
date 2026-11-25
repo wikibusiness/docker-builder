@@ -4,6 +4,8 @@
 use anyhow::{Result, bail};
 use bytes::Bytes;
 use futures::stream;
+use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use tokio::io::AsyncReadExt;
 
@@ -97,6 +99,24 @@ impl Live {
             }
         }))
         .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn prefetch(&self, repo: &str, tag: &str, platform: &str, digest: &str, diff_id: &str, size: u64, media_type: &str) -> Result<()> {
+        let mut platform = platform.split('/');
+        let config = Bytes::from(serde_json::to_vec(&json!({
+            "os": platform.next(), "architecture": platform.next(),
+            "rootfs": {"type": "layers", "diff_ids": [diff_id]},
+        }))?);
+        let config_digest = format!("sha256:{}", hex::encode(Sha256::digest(&config)));
+        let kind = "application/vnd.oci.image.manifest.v1+json";
+        let manifest = Bytes::from(serde_json::to_vec(&json!({
+            "schemaVersion": 2, "mediaType": kind,
+            "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": config_digest, "size": config.len()},
+            "layers": [{"mediaType": media_type, "digest": digest, "size": size}],
+        }))?);
+        self.blob_bytes(repo, &config_digest, config).await?;
+        self.manifest(repo, tag, kind, manifest).await
     }
 
     /// Streams a file as it is read, so a multi-GB layer is never held in memory.
