@@ -2116,7 +2116,7 @@ struct B {
     uploads: Memo<std::result::Result<(), String>>,
     live: Option<crate::live::Live>,
     early_run: Option<Arc<tokio::sync::Semaphore>>,
-    warm_platforms: Option<Mutex<std::collections::HashSet<String>>>,
+    warm_platforms: Option<Mutex<HashMap<String, (usize, usize)>>>,
     dest: Ref,
     target: usize,
     dirs: Memo<Dirs>,
@@ -2587,16 +2587,22 @@ impl B {
         pushed
     }
 
-    fn warm_prefix(self: &Arc<Self>, platform: &str, base: &[Blob], next: &[Blob], config: &Value) {
-        let (Some(live), Some(platforms), Some(first)) = (self.live.clone(), &self.warm_platforms, next.first()) else { return };
-        if self.early_run.is_none() || first.local.is_none() || !platforms.lock().unwrap().insert(platform.to_owned()) {
-            return;
-        }
+    fn warm_prefix(self: &Arc<Self>, platform: &str, base: &[Blob], next: &[Blob]) {
+        let (Some(live), Some(platforms)) = (self.live.clone(), &self.warm_platforms) else { return };
+        let count = base.len() + next.len();
+        let slot = {
+            let mut platforms = platforms.lock().unwrap();
+            let (slot, published) = platforms.entry(platform.to_string()).or_default();
+            if count <= *published { return }
+            *published = count;
+            *slot += 1;
+            *slot
+        };
         let me = self.clone();
-        let tag = format!("{}-ocean-warm-{}", self.dest.reference, arch_of(platform));
+        let tag = format!("{}-ocean-warm-{}-{slot}", self.dest.reference, arch_of(platform));
         if tag.len() > 128 { return }
-        let layers: Vec<_> = base.iter().chain([first]).cloned().collect();
-        let cfg = with_diff_ids(config, &layers);
+        let layers: Vec<_> = base.iter().chain(next).cloned().collect();
+        let cfg = with_diff_ids(&json!({"os":"linux", "architecture":arch_of(platform), "config":{}}), &layers);
         tokio::spawn(async move {
             let repo = &me.dest.repo;
             let cb = Bytes::from(cfg.to_string());
@@ -2611,13 +2617,15 @@ impl B {
                 live.blob_bytes(repo, &cd, cb).await?;
                 live.manifest(repo, &tag, kind, manifest).await
             };
-            if !matches!(tokio::time::timeout(std::time::Duration::from_secs(2), announce).await, Ok(Ok(()))) {
-                eprintln!("live: could not announce {tag}");
-                return;
-            }
-            for layer in &layers {
-                let _ = me.ensure_blob(&me.dest.host, repo, layer).await;
-            }
+            let upload = async {
+                let jobs: Vec<_> = layers.iter().map(|layer| me.ensure_blob(&me.dest.host, repo, layer).boxed()).collect();
+                stream::iter(jobs).buffer_unordered(16).collect::<Vec<_>>().await;
+            };
+            tokio::join!(async {
+                if !matches!(tokio::time::timeout(std::time::Duration::from_secs(2), announce).await, Ok(Ok(()))) {
+                    eprintln!("live: could not announce {tag}");
+                }
+            }, upload);
         });
     }
 
@@ -2783,6 +2791,17 @@ impl B {
         drop(pl);
         let sp = plan.platform.as_str();
         let label = format!("{} {}", arch_of(tp), plan.name);
+        let stream_platform = if self.warm_platforms.is_some() {
+            let mut ancestor = self.target;
+            loop {
+                if idx == ancestor { break Some(tp) }
+                match &self.plan(ancestor, tp).await?.base {
+                    Base::Stage(parent) => ancestor = *parent,
+                    _ => break None,
+                }
+            }
+        } else { None };
+        let final_stage = idx == self.target;
         // Resume after the last expensive step whose input key is cached; steps before it, and the stages they
         // read, are not looked at.
         let expensive: Vec<usize> = (0..plan.steps.len()).filter(|&i| !matches!(plan.steps[i].op, Op::Config | Op::Copy { src: Src::Context, .. })).collect();
@@ -2814,6 +2833,9 @@ impl B {
                 st
             }
         };
+        if let Some(tp) = stream_platform {
+            self.warm_prefix(tp, &state.layers, &[]);
+        }
         let mut wanted: HashMap<String, Vec<String>> = HashMap::new();
         for s in &plan.steps {
             if let Op::Copy { src: src @ (Src::Stage(_) | Src::Image(_)), sources, .. } = &s.op {
@@ -2822,6 +2844,7 @@ impl B {
         }
         let n = plan.steps.len();
         let last_layer = plan.steps.iter().rposition(|s| !matches!(s.op, Op::Config));
+        let delivery = (final_stage, stream_platform, last_layer);
         for (i, s) in plan.steps.iter().enumerate().take(start) {
             if !matches!(s.op, Op::Config) {
                 step_cached(&label, i, n, &s.text);
@@ -2845,7 +2868,7 @@ impl B {
                         cached_all(&mut pending);
                         step_cached(&label, i, n, &s.text);
                     } else {
-                        self.flush(&mut state, &mut pending, &label, n, (idx == self.target).then_some(tp), last_layer).await?;
+                        self.flush(&mut state, &mut pending, &label, n, delivery).await?;
                         step_open(&label, i, n, &s.text);
                         let seed_key = h(&["copy-seed", &state.key, sp, &s.text]);
                         let chown = self.ids(&state, chown.as_ref()).await?;
@@ -2875,8 +2898,9 @@ impl B {
                         step_done(&label, &format!(" ({:.1} MB)", bs.iter().map(|b| b.size).sum::<u64>() as f64 / 1e6));
                         state.layers.extend(bs);
                         }
-                        if idx == self.target && Some(i) != last_layer {
-                            self.warm_prefix(tp, &state.layers[..n0], &state.layers[n0..], &s.cfg);
+                        if let Some(tp) = stream_platform {
+                            self.warm_prefix(tp, &state.layers[..n0], &state.layers[n0..]);
+                        } else if final_stage && Some(i) != last_layer {
                             self.upload_early(&state.layers[n0..]);
                         }
                         // The layers' uncompressed digests are the content key: they cover every path, owner, mode and byte.
@@ -2906,11 +2930,12 @@ impl B {
                         cached_all(&mut pending);
                         step_cached(&label, i, n, &s.text);
                     } else {
-                        self.flush(&mut state, &mut pending, &label, n, (idx == self.target).then_some(tp), last_layer).await?;
+                        self.flush(&mut state, &mut pending, &label, n, delivery).await?;
                         step_open(&label, i, n, &s.text);
-                        let blobs = self.run(&state, &plan, s, &lookup, argv, env, mounts, secrets, network.as_deref(), &label, idx == self.target).await?;
-                        if idx == self.target && Some(i) != last_layer {
-                            self.warm_prefix(tp, &state.layers, &blobs, &s.cfg);
+                        let blobs = self.run(&state, &plan, s, &lookup, argv, env, mounts, secrets, network.as_deref(), &label, final_stage).await?;
+                        if let Some(tp) = stream_platform {
+                            self.warm_prefix(tp, &state.layers, &blobs);
+                        } else if final_stage && Some(i) != last_layer {
                             self.upload_early(&blobs);
                         }
                         state.layers.extend(blobs);
@@ -2922,15 +2947,18 @@ impl B {
             }
             state.cfg = with_diff_ids(&s.cfg, &state.layers);
             if !matches!(s.op, Op::Config | Op::Copy { src: Src::Context, .. }) {
+                if let Some(tp) = stream_platform {
+                    self.warm_prefix(tp, &state.layers, &[]);
+                }
                 self.record_bg(&state, &s.ikey, ()).await?;
             }
         }
-        self.flush(&mut state, &mut pending, &label, n, (idx == self.target).then_some(tp), last_layer).await?;
+        self.flush(&mut state, &mut pending, &label, n, delivery).await?;
         Ok(state)
     }
 
     /// Builds the pending context COPY layers onto `state`; its key already covers them.
-    async fn flush(self: &Arc<Self>, state: &mut State, pending: &mut Vec<(usize, &Step)>, label: &str, n: usize, final_platform: Option<&str>, last_layer: Option<usize>) -> Result<()> {
+    async fn flush(self: &Arc<Self>, state: &mut State, pending: &mut Vec<(usize, &Step)>, label: &str, n: usize, (final_stage, stream_platform, last_layer): (bool, Option<&str>, Option<usize>)) -> Result<()> {
         for (i, s) in pending.drain(..) {
             step_open(label, i, n, &s.text);
             let Op::Copy { sources, dest, chown, chmod, .. } = &s.op else { unreachable!() };
@@ -2957,12 +2985,13 @@ impl B {
                 }
             };
             step_done(label, &format!(" ({:.1} MB)", b.size as f64 / 1e6));
-            if let Some(platform) = final_platform {
+            if let Some(platform) = stream_platform {
+                self.warm_prefix(platform, &state.layers, std::slice::from_ref(&b));
+            } else if final_stage {
                 if self.early_run.is_none() {
                     let (me, bb) = (self.clone(), b.clone());
                     tokio::spawn(async move { me.ensure_blob(&me.dest.host, &me.dest.repo, &bb).await.ok() });
                 } else if Some(i) != last_layer {
-                    self.warm_prefix(platform, &state.layers, std::slice::from_ref(&b), &s.cfg);
                     self.upload_early(std::slice::from_ref(&b));
                 }
             }
@@ -3709,7 +3738,7 @@ async fn build_in(o: Opts) -> Result<String> {
         regs: Default::default(), plans: Default::default(), states: Default::default(), images: Default::default(), tops: Default::default(),
         published: Default::default(), rootfs: Default::default(), uploads: Default::default(), live: crate::live::Live::from_env(&d0.host), dest: d0.clone(), target, dirs: Default::default(), blobs: Default::default(), docker: OnceCell::new(),
         early_run: (std::env::var("IMGBUILD_EARLY_RUN").as_deref() == Ok("1")).then(|| Arc::new(tokio::sync::Semaphore::new(2))),
-        warm_platforms: (std::env::var("IMGBUILD_IMAGE_VOLUME").as_deref() == Ok("1")).then(Mutex::default),
+        warm_platforms: (std::env::var("IMGBUILD_IMAGE_VOLUME").as_deref() == Ok("1") && std::env::var("IMGBUILD_EARLY_RUN").as_deref() == Ok("1")).then(Mutex::default),
         binfmt: Default::default(), t0,
     });
     let platforms = b.o.platforms.clone();
