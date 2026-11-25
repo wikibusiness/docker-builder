@@ -37,6 +37,8 @@ image's push also
 
 With `IMGBUILD_EARLY_RUN=1`, completed final-stage `RUN` and `COPY` layers can upload in the background while subsequent steps run (up to two early uploads per build). A normal pull can start only once the final manifest is known, but it can overlap any uploads still in progress.
 
+With `IMGBUILD_IMAGE_VOLUME=1` as well, the builder announces one staging-only OCI image prefix per architecture at `<tag>-ocean-warm-<arch>`, including the layers in their actual final order. Kubernetes can request that reference as an image volume. It is never published to Harbor, and the ordinary image tag and digest are unchanged. The staging proxy must fall back to the completed platform image when no prefix is produced (for example, on a cache hit).
+
 The destination registry stays the source of truth. Live copy failures are logged and don't fail a build. Live writes use the push credentials.
 
 ## Cache scope

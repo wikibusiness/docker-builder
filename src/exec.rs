@@ -2116,6 +2116,7 @@ struct B {
     uploads: Memo<std::result::Result<(), String>>,
     live: Option<crate::live::Live>,
     early_run: Option<Arc<tokio::sync::Semaphore>>,
+    warm_platforms: Option<Mutex<std::collections::HashSet<String>>>,
     dest: Ref,
     target: usize,
     dirs: Memo<Dirs>,
@@ -2586,6 +2587,40 @@ impl B {
         pushed
     }
 
+    fn warm_prefix(self: &Arc<Self>, platform: &str, base: &[Blob], next: &[Blob], config: &Value) {
+        let (Some(live), Some(platforms), Some(first)) = (self.live.clone(), &self.warm_platforms, next.first()) else { return };
+        if self.early_run.is_none() || first.local.is_none() || !platforms.lock().unwrap().insert(platform.to_owned()) {
+            return;
+        }
+        let me = self.clone();
+        let tag = format!("{}-ocean-warm-{}", self.dest.reference, arch_of(platform));
+        if tag.len() > 128 { return }
+        let layers: Vec<_> = base.iter().chain([first]).cloned().collect();
+        let cfg = with_diff_ids(config, &layers);
+        tokio::spawn(async move {
+            let repo = &me.dest.repo;
+            let cb = Bytes::from(cfg.to_string());
+            let cd = sha(&cb);
+            let kind = "application/vnd.oci.image.manifest.v1+json";
+            let manifest = Bytes::from(json!({
+                "schemaVersion": 2, "mediaType": kind,
+                "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": cd, "size": cb.len()},
+                "layers": layers.iter().map(|l| json!({"mediaType": oci_layer_type(&l.media_type), "digest": l.digest, "size": l.size})).collect::<Vec<_>>(),
+            }).to_string());
+            let announce = async {
+                live.blob_bytes(repo, &cd, cb).await?;
+                live.manifest(repo, &tag, kind, manifest).await
+            };
+            if !matches!(tokio::time::timeout(std::time::Duration::from_secs(2), announce).await, Ok(Ok(()))) {
+                eprintln!("live: could not announce {tag}");
+                return;
+            }
+            for layer in &layers {
+                let _ = me.ensure_blob(&me.dest.host, repo, layer).await;
+            }
+        });
+    }
+
     fn upload_early(self: &Arc<Self>, layers: &[Blob]) {
         let Some(slots) = &self.early_run else { return };
         for blob in layers.iter().filter(|blob| blob.local.is_some()) {
@@ -2841,6 +2876,7 @@ impl B {
                         state.layers.extend(bs);
                         }
                         if idx == self.target && Some(i) != last_layer {
+                            self.warm_prefix(tp, &state.layers[..n0], &state.layers[n0..], &s.cfg);
                             self.upload_early(&state.layers[n0..]);
                         }
                         // The layers' uncompressed digests are the content key: they cover every path, owner, mode and byte.
@@ -2874,6 +2910,7 @@ impl B {
                         step_open(&label, i, n, &s.text);
                         let blobs = self.run(&state, &plan, s, &lookup, argv, env, mounts, secrets, network.as_deref(), &label, idx == self.target).await?;
                         if idx == self.target && Some(i) != last_layer {
+                            self.warm_prefix(tp, &state.layers, &blobs, &s.cfg);
                             self.upload_early(&blobs);
                         }
                         state.layers.extend(blobs);
@@ -2920,11 +2957,12 @@ impl B {
                 }
             };
             step_done(label, &format!(" ({:.1} MB)", b.size as f64 / 1e6));
-            if final_platform.is_some() {
+            if let Some(platform) = final_platform {
                 if self.early_run.is_none() {
                     let (me, bb) = (self.clone(), b.clone());
                     tokio::spawn(async move { me.ensure_blob(&me.dest.host, &me.dest.repo, &bb).await.ok() });
                 } else if Some(i) != last_layer {
+                    self.warm_prefix(platform, &state.layers, std::slice::from_ref(&b), &s.cfg);
                     self.upload_early(std::slice::from_ref(&b));
                 }
             }
@@ -3671,6 +3709,7 @@ async fn build_in(o: Opts) -> Result<String> {
         regs: Default::default(), plans: Default::default(), states: Default::default(), images: Default::default(), tops: Default::default(),
         published: Default::default(), rootfs: Default::default(), uploads: Default::default(), live: crate::live::Live::from_env(&d0.host), dest: d0.clone(), target, dirs: Default::default(), blobs: Default::default(), docker: OnceCell::new(),
         early_run: (std::env::var("IMGBUILD_EARLY_RUN").as_deref() == Ok("1")).then(|| Arc::new(tokio::sync::Semaphore::new(2))),
+        warm_platforms: (std::env::var("IMGBUILD_IMAGE_VOLUME").as_deref() == Ok("1")).then(Mutex::default),
         binfmt: Default::default(), t0,
     });
     let platforms = b.o.platforms.clone();
