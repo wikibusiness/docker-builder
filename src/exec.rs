@@ -43,7 +43,7 @@ pub struct Opts {
     /// Every platform of the image when this run builds only some of them (see `build`)
     pub all_platforms: Vec<String>,
     /// Image paths (e.g. `/build`) written to a host directory before the image is pushed.
-    pub export: Vec<(String, PathBuf)>,
+    pub export: Vec<(Option<String>, String, PathBuf)>,
 }
 
 /// Part of every cache key: bump it when imgbuild changes the bytes it writes for the same inputs.
@@ -3842,17 +3842,27 @@ async fn build_in(o: Opts) -> Result<String> {
             }
         }
     }
-    let states = try_join_all(platforms.iter().map(|p| b.state(target, p))).await?;
-    if !b.o.export.is_empty() {
-        for (platform, state) in platforms.iter().zip(&states) {
-            if arch_of(platform) != "amd64" {
-                continue;
-            }
-            for (prefix, dest) in &b.o.export {
-                let t = Instant::now();
-                export_tree(&b, state, prefix, dest).await?;
-                eprintln!("export {prefix} -> {} [{:.2}s]", dest.display(), t.elapsed().as_secs_f64());
-            }
+    let early_exports = async {
+        let Some(platform) = platforms.iter().find(|p| arch_of(p) == "amd64") else { return Ok(()) };
+        for (stage, prefix, dest) in &b.o.export {
+            let Some(stage) = stage.as_deref() else { continue };
+            let index = dockerfile::target_index(&b.stages, Some(stage))?;
+            let state = b.state(index, platform).await?;
+            let t = Instant::now();
+            export_tree(&b, &state, prefix, dest).await?;
+            eprintln!("export {stage}:{prefix} -> {} [{:.2}s]", dest.display(), t.elapsed().as_secs_f64());
+        }
+        Ok(())
+    };
+    let (states, ()) = tokio::try_join!(try_join_all(platforms.iter().map(|p| b.state(target, p))), early_exports)?;
+    for (platform, state) in platforms.iter().zip(&states) {
+        if arch_of(platform) != "amd64" {
+            continue;
+        }
+        for (_, prefix, dest) in b.o.export.iter().filter(|(stage, _, _)| stage.is_none()) {
+            let t = Instant::now();
+            export_tree(&b, state, prefix, dest).await?;
+            eprintln!("export {prefix} -> {} [{:.2}s]", dest.display(), t.elapsed().as_secs_f64());
         }
     }
     let push_id = STEP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;

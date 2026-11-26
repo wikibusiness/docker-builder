@@ -54,8 +54,8 @@ enum Cli {
         base: Vec<String>,
         #[arg(long, default_value = "/tmp/imgbuild")]
         work: PathBuf,
-        /// Image path copied to a host directory after the build (e.g. `/build=$RUNNER_TEMP/out`); repeatable
-        #[arg(long, value_name = "IMAGE_PATH=HOST_DIR")]
+        /// Copy an image path to a host directory. Prefix with STAGE: to export as soon as that stage is ready; repeatable
+        #[arg(long, value_name = "[STAGE:]IMAGE_PATH=HOST_DIR")]
         export: Vec<String>,
         /// Do the base-image and non-`late` layer work now, then wait for this file to exist before building `late` layers
         #[arg(long)]
@@ -294,8 +294,11 @@ async fn main() -> Result<()> {
             anyhow::ensure!(base.is_empty(), "--base only applies to a TOML spec");
             anyhow::ensure!(platforms.iter().all(|p| all_platforms.is_empty() || all_platforms.contains(p)), "--all-platforms must include every --platforms");
             let export = export.iter().map(|s| {
-                let (from, to) = s.split_once('=').context("--export requires IMAGE_PATH=HOST_DIR")?;
-                Ok((from.to_string(), PathBuf::from(to)))
+                let (from, to) = s.split_once('=').context("--export requires [STAGE:]IMAGE_PATH=HOST_DIR")?;
+                let (stage, path) = from.split_once(':')
+                    .filter(|(stage, path)| !stage.contains('/') && path.starts_with('/'))
+                    .map_or((None, from), |(stage, path)| (Some(stage.to_string()), path));
+                Ok((stage, path.to_string(), PathBuf::from(to)))
             }).collect::<Result<Vec<_>>>()?;
             let digest = exec::build(exec::Opts { dockerfile, context, target, platforms, dests: dest, cache: cache_repo, build_args: build_arg, work, epoch, all_platforms, export }).await?;
             println!("{digest}");
