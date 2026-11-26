@@ -123,8 +123,8 @@ impl S3 {
         bail!("PUT {key}: {last}")
     }
 
-    /// key -> size for everything under prefix
-    pub async fn list(&self, bucket: &str, prefix: &str) -> Result<HashMap<String, u64>> {
+    /// key -> (size, ETag) for everything under prefix
+    pub async fn list(&self, bucket: &str, prefix: &str) -> Result<HashMap<String, (u64, String)>> {
         let mut out = HashMap::new();
         let mut token: Option<String> = None;
         loop {
@@ -135,7 +135,8 @@ impl S3 {
             let x = r.text().await?;
             for c in x.split("<Contents>").skip(1) {
                 let tag = |t: &str| c.split(&format!("<{t}>")).nth(1).and_then(|s| s.split(&format!("</{t}>")).next()).unwrap_or("").to_string();
-                out.insert(tag("Key").replace("&amp;", "&"), tag("Size").parse().unwrap_or(0));
+                let etag = tag("ETag").replace("&quot;", "\"");
+                out.insert(tag("Key").replace("&amp;", "&"), (tag("Size").parse().unwrap_or(0), etag));
             }
             token = x.split("<NextContinuationToken>").nth(1).and_then(|s| s.split("</NextContinuationToken>").next()).map(String::from);
             if !x.contains("<IsTruncated>true</IsTruncated>") || token.is_none() { break; }
@@ -162,9 +163,18 @@ pub struct Args {
     pub region: String,
     pub cache_control: String,
     pub concurrency: usize,
+    pub verify_content: bool,
 }
 
-/// aws s3 sync --size-only equivalent (excluding *.br *.gz *.map), then the marker object.
+fn present(path: &Path, obj: Option<&(u64, String)>, verify: bool) -> bool {
+    let Some((size, etag)) = obj else { return false };
+    std::fs::metadata(path).is_ok_and(|m| m.len() == *size)
+        && (!verify || std::fs::read(path).is_ok_and(|bytes| {
+            etag.trim_matches('"').eq_ignore_ascii_case(&hex::encode(md5::Md5::digest(bytes)))
+        }))
+}
+
+/// Sync without *.br, *.gz or *.map, then write the marker object.
 pub async fn sync(a: Args) -> Result<()> {
     let s3 = S3::from_env(&a.endpoint, &a.region)?;
     let t = std::time::Instant::now();
@@ -174,8 +184,7 @@ pub async fn sync(a: Args) -> Result<()> {
     let prefix = a.prefix.trim_matches('/').to_string();
     let existing = s3.list(&a.bucket, &format!("{prefix}/")).await?;
     let todo: Vec<_> = files.iter().filter(|(p, r)| {
-        let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-        existing.get(&format!("{prefix}/{r}")) != Some(&size)
+        !present(p, existing.get(&format!("{prefix}/{r}")), a.verify_content)
     }).collect();
     eprintln!("cdn: {} files, {} to upload ({} already present) [{:.2}s]", files.len(), todo.len(), files.len() - todo.len(), t.elapsed().as_secs_f64());
     let s3 = &s3;
@@ -201,5 +210,17 @@ mod tests {
     fn encodes_like_sigv4() {
         assert_eq!(super::enc("a b/c+d", true), "a%20b/c%2Bd");
         assert_eq!(super::enc("a/b", false), "a%2Fb");
+    }
+
+    #[test]
+    fn verified_sync_replaces_same_size_different_content() {
+        let path = std::env::temp_dir().join(format!("imgbuild-cdn-etag-{}", std::process::id()));
+        std::fs::write(&path, b"abc").unwrap();
+        let wrong = (3, "4ed9407630eb1000c0f6b63842defa7d".into());
+        let exact = (3, "\"900150983cd24fb0d6963f7d28e17f72\"".into());
+        assert!(super::present(&path, Some(&wrong), false));
+        assert!(!super::present(&path, Some(&wrong), true));
+        assert!(super::present(&path, Some(&exact), true));
+        std::fs::remove_file(path).unwrap();
     }
 }

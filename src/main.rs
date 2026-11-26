@@ -82,6 +82,9 @@ enum Cli {
         cache_control: String,
         #[arg(long, default_value_t = 128)]
         concurrency: usize,
+        /// Match the content ETag as well as the file size before skipping a PUT
+        #[arg(long)]
+        verify_content: bool,
     },
 }
 
@@ -328,8 +331,8 @@ async fn main() -> Result<()> {
             }
             return Ok(());
         }
-        Cli::Cdn { dir, bucket, prefix, marker, endpoint, region, cache_control, concurrency } => {
-            return cdn::sync(cdn::Args { dir, bucket, prefix, marker, endpoint, region, cache_control, concurrency }).await;
+        Cli::Cdn { dir, bucket, prefix, marker, endpoint, region, cache_control, concurrency, verify_content } => {
+            return cdn::sync(cdn::Args { dir, bucket, prefix, marker, endpoint, region, cache_control, concurrency, verify_content }).await;
         }
     };
     let t0 = Instant::now();
