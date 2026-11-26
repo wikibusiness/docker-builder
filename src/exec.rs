@@ -772,7 +772,7 @@ async fn export_tree(b: &Arc<B>, state: &State, prefix: &str, dest: &Path) -> Re
         Some(&rf.meta),
         None,
         &[format!("/{p}")],
-        &format!("{}/", dest.to_string_lossy()),
+        "/",
         None,
         None,
     )?;

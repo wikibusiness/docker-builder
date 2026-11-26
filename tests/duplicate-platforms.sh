@@ -24,7 +24,8 @@ index() {
 all=(--all-platforms 'linux/arm64,linux/amd64' --all-platforms 'linux/arm64,linux/amd64')
 build --platforms linux/arm64,linux/arm64 "${all[@]}" --dest "$ref-split"
 test "$(curl -sS -o /dev/null -w '%{http_code}' -H "$accept" "$manifest-split")" = 404
-build --platforms linux/amd64 "${all[@]}" --dest "$ref-split"
+build --platforms linux/amd64 "${all[@]}" --dest "$ref-split" --export "/payload=$root/export"
+cmp "$root/context/payload" "$root/export/payload"
 index "$manifest-split"
 build --platforms linux/arm64,linux/amd64,linux/arm64 --dest "$ref-full"
 index "$manifest-full"
