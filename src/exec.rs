@@ -42,6 +42,7 @@ pub struct Opts {
     pub epoch: u64,
     /// Every platform of the image when this run builds only some of them (see `build`)
     pub all_platforms: Vec<String>,
+    pub single_manifest: bool,
     /// Image paths (e.g. `/build`) written to a host directory before the image is pushed.
     pub export: Vec<(String, PathBuf)>,
 }
@@ -3721,6 +3722,8 @@ pub async fn build(mut o: Opts) -> Result<String> {
         let mut seen = HashSet::new();
         platforms.retain(|p| seen.insert(p.clone()));
     }
+    ensure!(!o.single_manifest || (o.platforms.len() == 1 && o.all_platforms.is_empty() && o.dests.len() == 1),
+        "--single-manifest requires one platform and one destination");
     // Absolute once: resolving a relative path calls getcwd, which costs ~100 µs on macOS, per context file.
     o.context = std::path::absolute(&o.context)?;
     let work = o.work.clone();
@@ -3859,6 +3862,14 @@ async fn build_in(o: Opts) -> Result<String> {
     let push_t = Instant::now();
     let _export = crate::prof::span("export", || format!("#{push_id}"));
     eprintln!("#{push_id} exporting to image");
+    if b.o.single_manifest {
+        let state = &states[0];
+        let mut cfg = state.cfg.clone();
+        cfg["created"] = json!(crate::rfc3339(b.o.epoch));
+        let (_, digest) = b.push_image(&d0.host, &d0.repo, &state.layers, &cfg, Some(&d0.reference), None, Some(push_id)).await?;
+        eprintln!("#{push_id} DONE {:.1}s", push_t.elapsed().as_secs_f64());
+        return Ok(digest);
+    }
     // Built in parts (one run per platform, e.g. one CI job per CPU): each part is pushed as `<tag>-<arch>`,
     // and the run that finds every part present pushes the index. Two runs finishing at once both push it;
     // the bytes are the same, so the second PUT is a no-op (or refused as an existing immutable tag).

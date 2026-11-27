@@ -23,6 +23,8 @@ docker stop imgbuild-registry
 
 Use a separate `--work` directory per concurrent invocation. Only build Dockerfiles you trust.
 
+For Dockerfile builds with one platform and one destination, `--single-manifest` publishes the OCI image manifest directly at the destination tag instead of wrapping it in a one-entry index. Use it only when consumers accept an OCI image manifest. Split multi-platform builds (`--all-platforms`) cannot use this flag.
+
 ## Live staging pulls
 
 A pull that starts before a push ends cannot get anything: a registry refuses a manifest whose layers are missing. With

@@ -29,3 +29,13 @@ cmp "$root/context/payload" "$root/export/payload"
 index "$manifest-split"
 build --platforms linux/arm64,linux/amd64,linux/arm64 --dest "$ref-full"
 index "$manifest-full"
+
+build --platforms linux/amd64 --dest "$ref-index"
+curl -fsS -H "$accept" "$manifest-index" | jq -e '.manifests | length == 1'
+digest=$(build --platforms linux/amd64 --single-manifest --dest "$ref-direct")
+body=$(curl -fsS -H 'Accept: application/vnd.oci.image.manifest.v1+json' "$manifest-direct")
+jq -e '.mediaType == "application/vnd.oci.image.manifest.v1+json" and (.layers | length == 1)' <<<"$body"
+test "$digest" = "sha256:$(printf %s "$body" | sha256sum | cut -d' ' -f1)"
+if build --platforms linux/amd64,linux/arm64 --single-manifest --dest "$ref-invalid"; then
+  exit 1
+fi

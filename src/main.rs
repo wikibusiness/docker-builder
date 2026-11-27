@@ -47,6 +47,9 @@ enum Cli {
         /// each run pushes `<tag>-<arch>`, and the one that finds all of them pushes the multi-platform `<tag>`
         #[arg(long, value_delimiter = ',')]
         all_platforms: Vec<String>,
+        /// Publish a single-platform Dockerfile build directly as an image manifest, not an index
+        #[arg(long, requires = "dockerfile", conflicts_with = "all_platforms")]
+        single_manifest: bool,
         #[arg(long, required = true)]
         dest: Vec<String>,
         /// Base image, overriding the spec: `<ref>` for every platform or `<os/arch>=<ref>`; repeatable
@@ -293,14 +296,14 @@ async fn finish_platform(ctx: &Ctx, platform: &str, prep: Prep, early: &[Built],
 async fn main() -> Result<()> {
     let epoch: u64 = std::env::var("SOURCE_DATE_EPOCH").ok().and_then(|v| v.parse().ok()).unwrap_or(1_704_067_200);
     let (spec_path, dest_args, base_args, work_dir, wait_for) = match Cli::parse() {
-        Cli::Build { dockerfile: Some(dockerfile), spec: None, target, context, build_arg, cache_repo, platforms, all_platforms, dest, base, work, export, wait_for: None } => {
+        Cli::Build { dockerfile: Some(dockerfile), spec: None, target, context, build_arg, cache_repo, platforms, all_platforms, single_manifest, dest, base, work, export, wait_for: None } => {
             anyhow::ensure!(base.is_empty(), "--base only applies to a TOML spec");
             anyhow::ensure!(platforms.iter().all(|p| all_platforms.is_empty() || all_platforms.contains(p)), "--all-platforms must include every --platforms");
             let export = export.iter().map(|s| {
                 let (from, to) = s.split_once('=').context("--export requires IMAGE_PATH=HOST_DIR")?;
                 Ok((from.to_string(), PathBuf::from(to)))
             }).collect::<Result<Vec<_>>>()?;
-            let digest = exec::build(exec::Opts { dockerfile, context, target, platforms, dests: dest, cache: cache_repo, build_args: build_arg, work, epoch, all_platforms, export }).await?;
+            let digest = exec::build(exec::Opts { dockerfile, context, target, platforms, dests: dest, cache: cache_repo, build_args: build_arg, work, epoch, all_platforms, single_manifest, export }).await?;
             println!("{digest}");
             return Ok(());
         }
